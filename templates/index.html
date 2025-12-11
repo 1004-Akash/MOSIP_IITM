@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OCR Text Extraction and Verification</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+            padding: 30px;
+        }
+        
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            text-align: center;
+        }
+        
+        .subtitle {
+            text-align: center;
+            color: #666;
+            margin-bottom: 30px;
+        }
+        
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 30px;
+            border-bottom: 2px solid #eee;
+        }
+        
+        .tab {
+            padding: 12px 24px;
+            background: none;
+            border: none;
+            cursor: pointer;
+            font-size: 16px;
+            color: #666;
+            border-bottom: 3px solid transparent;
+            transition: all 0.3s;
+        }
+        
+        .tab.active {
+            color: #667eea;
+            border-bottom-color: #667eea;
+            font-weight: 600;
+        }
+        
+        .tab-content {
+            display: none;
+        }
+        
+        .tab-content.active {
+            display: block;
+        }
+        
+        .upload-area {
+            border: 3px dashed #667eea;
+            border-radius: 10px;
+            padding: 40px;
+            text-align: center;
+            margin-bottom: 20px;
+            transition: all 0.3s;
+            cursor: pointer;
+        }
+        
+        .upload-area:hover {
+            background: #f8f9ff;
+            border-color: #764ba2;
+        }
+        
+        .upload-area.dragover {
+            background: #f0f4ff;
+            border-color: #764ba2;
+        }
+        
+        .file-input {
+            display: none;
+        }
+        
+        .btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 12px 30px;
+            border-radius: 8px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: transform 0.2s;
+            margin: 10px 5px;
+        }
+        
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+        
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 8px;
+            color: #333;
+            font-weight: 500;
+        }
+        
+        select, input[type="text"] {
+            width: 100%;
+            padding: 10px;
+            border: 2px solid #ddd;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+        
+        select:focus, input[type="text"]:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        .results {
+            margin-top: 30px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 10px;
+            display: none;
+        }
+        
+        .results.show {
+            display: block;
+        }
+        
+        .field-item {
+            background: white;
+            padding: 15px;
+            margin-bottom: 10px;
+            border-radius: 6px;
+            border-left: 4px solid #667eea;
+        }
+        
+        .field-label {
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 5px;
+        }
+        
+        .field-value {
+            color: #666;
+        }
+        
+        .confidence {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            margin-left: 10px;
+        }
+        
+        .confidence.high {
+            background: #d4edda;
+            color: #155724;
+        }
+        
+        .confidence.medium {
+            background: #fff3cd;
+            color: #856404;
+        }
+        
+        .confidence.low {
+            background: #f8d7da;
+            color: #721c24;
+        }
+        
+        .verification-result {
+            padding: 15px;
+            margin-bottom: 10px;
+            border-radius: 6px;
+        }
+        
+        .verification-result.match {
+            background: #d4edda;
+            border-left: 4px solid #28a745;
+        }
+        
+        .verification-result.mismatch {
+            background: #f8d7da;
+            border-left: 4px solid #dc3545;
+        }
+        
+        .verification-result.unsure {
+            background: #fff3cd;
+            border-left: 4px solid #ffc107;
+        }
+        
+        .status-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        
+        .status-match {
+            background: #28a745;
+            color: white;
+        }
+        
+        .status-mismatch {
+            background: #dc3545;
+            color: white;
+        }
+        
+        .status-unsure {
+            background: #ffc107;
+            color: #333;
+        }
+        
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 20px;
+        }
+        
+        .loading.show {
+            display: block;
+        }
+        
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .form-fields {
+            margin-top: 20px;
+        }
+        
+        .form-field {
+            margin-bottom: 15px;
+        }
+        
+        .form-field input {
+            width: 100%;
+            padding: 10px;
+            border: 2px solid #ddd;
+            border-radius: 6px;
+        }
+        
+        .overall-score {
+            text-align: center;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-radius: 10px;
+            margin-bottom: 20px;
+        }
+        
+        .overall-score h3 {
+            font-size: 48px;
+            margin: 10px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔍 OCR Text Extraction & Verification</h1>
+        <p class="subtitle">Extract and verify text from identity documents</p>
+        
+        <div class="tabs">
+            <button class="tab active" onclick="switchTab('extract')">Extract Text</button>
+            <button class="tab" onclick="switchTab('verify')">Verify Data</button>
+        </div>
+        
+        <!-- Extract Tab -->
+        <div id="extract-tab" class="tab-content active">
+            <div class="upload-area" onclick="document.getElementById('extract-file').click()" 
+                 ondrop="handleDrop(event, 'extract')" 
+                 ondragover="handleDragOver(event)" 
+                 ondragleave="handleDragLeave(event)">
+                <p>📄 Click or drag & drop your document here</p>
+                <p style="color: #999; font-size: 14px; margin-top: 10px;">Supports: JPG, PNG, PDF</p>
+            </div>
+            <input type="file" id="extract-file" class="file-input" accept="image/*,.pdf" onchange="handleFileSelect(event, 'extract')">
+            
+            <div class="form-group">
+                <label for="document-type">Document Type:</label>
+                <select id="document-type">
+                    <option value="ID_CARD">ID Card</option>
+                    <option value="FORM">Form</option>
+                    <option value="CERTIFICATE">Certificate</option>
+                </select>
+            </div>
+            
+            <button class="btn" onclick="extractText()" id="extract-btn">Extract Text</button>
+            
+            <div class="loading" id="extract-loading">
+                <div class="spinner"></div>
+                <p>Processing document...</p>
+            </div>
+            
+            <div class="results" id="extract-results">
+                <h3>Extraction Results</h3>
+                <div id="extract-content"></div>
+            </div>
+        </div>
+        
+        <!-- Verify Tab -->
+        <div id="verify-tab" class="tab-content">
+            <div class="upload-area" onclick="document.getElementById('verify-file').click()" 
+                 ondrop="handleDrop(event, 'verify')" 
+                 ondragover="handleDragOver(event)" 
+                 ondragleave="handleDragLeave(event)">
+                <p>📄 Click or drag & drop your document here</p>
+                <p style="color: #999; font-size: 14px; margin-top: 10px;">Supports: JPG, PNG, PDF</p>
+            </div>
+            <input type="file" id="verify-file" class="file-input" accept="image/*,.pdf" onchange="handleFileSelect(event, 'verify')">
+            
+            <div class="form-fields" id="form-fields">
+                <h3>Enter Form Data to Verify</h3>
+                <div class="form-field">
+                    <label>Name:</label>
+                    <input type="text" id="form-name" placeholder="Enter name">
+                </div>
+                <div class="form-field">
+                    <label>Date of Birth:</label>
+                    <input type="text" id="form-dob" placeholder="YYYY-MM-DD or MM/DD/YYYY">
+                </div>
+                <div class="form-field">
+                    <label>ID Number:</label>
+                    <input type="text" id="form-id" placeholder="Enter ID number">
+                </div>
+                <div class="form-field">
+                    <label>Address:</label>
+                    <input type="text" id="form-address" placeholder="Enter address">
+                </div>
+                <div class="form-field">
+                    <label>Phone:</label>
+                    <input type="text" id="form-phone" placeholder="Enter phone number">
+                </div>
+                <div class="form-field">
+                    <label>Email:</label>
+                    <input type="text" id="form-email" placeholder="Enter email">
+                </div>
+            </div>
+            
+            <button class="btn" onclick="verifyData()" id="verify-btn">Verify Data</button>
+            
+            <div class="loading" id="verify-loading">
+                <div class="spinner"></div>
+                <p>Verifying data...</p>
+            </div>
+            
+            <div class="results" id="verify-results">
+                <h3>Verification Results</h3>
+                <div id="verify-content"></div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        let extractFile = null;
+        let verifyFile = null;
+        
+        function switchTab(tab) {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+            
+            if (tab === 'extract') {
+                document.querySelector('.tab:first-child').classList.add('active');
+                document.getElementById('extract-tab').classList.add('active');
+            } else {
+                document.querySelector('.tab:last-child').classList.add('active');
+                document.getElementById('verify-tab').classList.add('active');
+            }
+        }
+        
+        function handleDragOver(e) {
+            e.preventDefault();
+            e.currentTarget.classList.add('dragover');
+        }
+        
+        function handleDragLeave(e) {
+            e.currentTarget.classList.remove('dragover');
+        }
+        
+        function handleDrop(e, type) {
+            e.preventDefault();
+            e.currentTarget.classList.remove('dragover');
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                if (type === 'extract') {
+                    extractFile = files[0];
+                    updateFileDisplay('extract', files[0].name);
+                } else {
+                    verifyFile = files[0];
+                    updateFileDisplay('verify', files[0].name);
+                }
+            }
+        }
+        
+        function handleFileSelect(e, type) {
+            const file = e.target.files[0];
+            if (file) {
+                if (type === 'extract') {
+                    extractFile = file;
+                    updateFileDisplay('extract', file.name);
+                } else {
+                    verifyFile = file;
+                    updateFileDisplay('verify', file.name);
+                }
+            }
+        }
+        
+        function updateFileDisplay(type, filename) {
+            const uploadArea = type === 'extract' 
+                ? document.querySelector('#extract-tab .upload-area')
+                : document.querySelector('#verify-tab .upload-area');
+            uploadArea.innerHTML = `<p>📄 Selected: <strong>${filename}</strong></p>`;
+        }
+        
+        async function extractText() {
+            if (!extractFile) {
+                alert('Please select a file first');
+                return;
+            }
+            
+            const documentType = document.getElementById('document-type').value;
+            const formData = new FormData();
+            formData.append('file', extractFile);
+            formData.append('document_type', documentType);
+            
+            const loading = document.getElementById('extract-loading');
+            const results = document.getElementById('extract-results');
+            const content = document.getElementById('extract-content');
+            const btn = document.getElementById('extract-btn');
+            
+            loading.classList.add('show');
+            results.classList.remove('show');
+            btn.disabled = true;
+            
+            try {
+                const response = await fetch('/api/v1/ocr/extract', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                
+                if (!response.ok) {
+                    throw new Error(data.detail || 'Extraction failed');
+                }
+                
+                // Display results
+                let html = `<div class="overall-score">
+                    <p>Overall Confidence</p>
+                    <h3>${(data.overall_confidence * 100).toFixed(1)}%</h3>
+                </div>`;
+                
+                html += '<h4>Structured Data:</h4>';
+                for (const [field, value] of Object.entries(data.structured_data)) {
+                    const confidence = data.confidence_scores[field] || 0;
+                    const confClass = confidence > 0.8 ? 'high' : confidence > 0.6 ? 'medium' : 'low';
+                    html += `
+                        <div class="field-item">
+                            <div class="field-label">
+                                ${field.charAt(0).toUpperCase() + field.slice(1).replace('_', ' ')}
+                                <span class="confidence ${confClass}">${(confidence * 100).toFixed(0)}%</span>
+                            </div>
+                            <div class="field-value">${value || '<em>Not found</em>'}</div>
+                        </div>
+                    `;
+                }
+                
+                html += '<h4 style="margin-top: 20px;">Raw Text:</h4>';
+                html += `<div style="background: white; padding: 15px; border-radius: 6px; white-space: pre-wrap; font-family: monospace; max-height: 300px; overflow-y: auto;">${data.raw_text || 'No text extracted'}</div>`;
+                
+                content.innerHTML = html;
+                results.classList.add('show');
+            } catch (error) {
+                alert('Error: ' + error.message);
+            } finally {
+                loading.classList.remove('show');
+                btn.disabled = false;
+            }
+        }
+        
+        async function verifyData() {
+            if (!verifyFile) {
+                alert('Please select a file first');
+                return;
+            }
+            
+            // Collect form data
+            const formData = {
+                name: document.getElementById('form-name').value,
+                dob: document.getElementById('form-dob').value,
+                id_number: document.getElementById('form-id').value,
+                address: document.getElementById('form-address').value,
+                phone: document.getElementById('form-phone').value,
+                email: document.getElementById('form-email').value
+            };
+            
+            // Remove empty fields
+            Object.keys(formData).forEach(key => {
+                if (!formData[key]) delete formData[key];
+            });
+            
+            if (Object.keys(formData).length === 0) {
+                alert('Please fill at least one field to verify');
+                return;
+            }
+            
+            const requestData = new FormData();
+            requestData.append('file', verifyFile);
+            requestData.append('form_data', JSON.stringify(formData));
+            
+            const loading = document.getElementById('verify-loading');
+            const results = document.getElementById('verify-results');
+            const content = document.getElementById('verify-content');
+            const btn = document.getElementById('verify-btn');
+            
+            loading.classList.add('show');
+            results.classList.remove('show');
+            btn.disabled = true;
+            
+            try {
+                const response = await fetch('/api/v1/verify', {
+                    method: 'POST',
+                    body: requestData
+                });
+                
+                const data = await response.json();
+                
+                if (!response.ok) {
+                    throw new Error(data.detail || 'Verification failed');
+                }
+                
+                // Display results
+                let html = `<div class="overall-score">
+                    <p>Overall Verification Score</p>
+                    <h3>${(data.overall_verification_score * 100).toFixed(1)}%</h3>
+                </div>`;
+                
+                html += '<h4>Field Verification:</h4>';
+                data.field_results.forEach(result => {
+                    const statusClass = result.status;
+                    const statusBadge = `<span class="status-badge status-${result.status}">${result.status}</span>`;
+                    html += `
+                        <div class="verification-result ${statusClass}">
+                            <div class="field-label">
+                                ${result.field.charAt(0).toUpperCase() + result.field.slice(1).replace('_', ' ')} ${statusBadge}
+                                <span style="float: right;">Similarity: ${(result.similarity_score * 100).toFixed(1)}%</span>
+                            </div>
+                            <div style="margin-top: 10px;">
+                                <div><strong>Document:</strong> ${result.document_value || '<em>Not found</em>'}</div>
+                                <div><strong>Form:</strong> ${result.form_value}</div>
+                            </div>
+                        </div>
+                    `;
+                });
+                
+                if (data.mismatched_fields.length > 0) {
+                    html += `<div style="background: #f8d7da; padding: 15px; border-radius: 6px; margin-top: 20px;">
+                        <strong>⚠️ Mismatched Fields:</strong> ${data.mismatched_fields.join(', ')}
+                    </div>`;
+                }
+                
+                if (data.missing_fields.length > 0) {
+                    html += `<div style="background: #fff3cd; padding: 15px; border-radius: 6px; margin-top: 10px;">
+                        <strong>⚠️ Missing Fields:</strong> ${data.missing_fields.join(', ')}
+                    </div>`;
+                }
+                
+                content.innerHTML = html;
+                results.classList.add('show');
+            } catch (error) {
+                alert('Error: ' + error.message);
+            } finally {
+                loading.classList.remove('show');
+                btn.disabled = false;
+            }
+        }
+    </script>
+</body>
+</html>
+
