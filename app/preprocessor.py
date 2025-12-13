@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 from PIL import Image
 import logging
+from typing import Dict
 
 logger = logging.getLogger(__name__)
 
@@ -175,4 +176,40 @@ class ImagePreprocessor:
             logger.error(f"Error in preprocessing: {e}")
             # Return original image if preprocessing fails
             return image
+
+    @staticmethod
+    def quality_metrics(image: Image.Image) -> Dict[str, float]:
+        """
+        Compute basic quality metrics: blur, brightness, contrast
+        Returns a quality_score (0-1) and components.
+        """
+        try:
+            cv_img = ImagePreprocessor.pil_to_cv2(image)
+            gray = ImagePreprocessor.convert_to_grayscale(cv_img)
+            # Blur: variance of Laplacian
+            lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+            # Normalize blur score (heuristic)
+            blur_score = min(1.0, lap_var / 300.0)
+            # Brightness and contrast
+            brightness = float(np.mean(gray) / 255.0)
+            contrast = float(np.std(gray) / 128.0)
+            contrast = min(1.0, contrast)
+            # Aggregate quality (simple average)
+            quality = (blur_score + brightness + contrast) / 3.0
+            return {
+                "quality": round(quality, 3),
+                "blur_score": round(blur_score, 3),
+                "brightness": round(brightness, 3),
+                "contrast": round(contrast, 3),
+                "laplacian_variance": float(round(lap_var, 2)),
+            }
+        except Exception as e:
+            logger.error(f"Error computing quality metrics: {e}")
+            return {
+                "quality": 0.0,
+                "blur_score": 0.0,
+                "brightness": 0.0,
+                "contrast": 0.0,
+                "laplacian_variance": 0.0,
+            }
 

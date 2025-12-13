@@ -61,9 +61,17 @@ class DataVerifier:
         if not value:
             return ""
         
-        # Try to extract date components
+        # Try using dateutil parser first (more robust)
+        try:
+            from dateutil import parser
+            dt = parser.parse(value, fuzzy=True, dayfirst=False)
+            return dt.strftime("%Y-%m-%d")
+        except:
+            pass
+        
+        # Fallback to regex patterns
         date_patterns = [
-            r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})',  # YYYY-MM-DD
+            r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})',  # YYYY-MM-DD or YYYY/MM/DD
             r'(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})',  # MM-DD-YYYY or DD-MM-YYYY
         ]
         
@@ -71,12 +79,14 @@ class DataVerifier:
             match = re.search(pattern, value)
             if match:
                 parts = match.groups()
-                if len(parts[2]) == 4:  # YYYY-MM-DD
+                if len(parts[2]) == 4:  # DD-MM-YYYY format
                     return f"{parts[2]}-{parts[1].zfill(2)}-{parts[0].zfill(2)}"
-                elif len(parts[0]) == 4:  # YYYY-MM-DD
+                elif len(parts[0]) == 4:  # YYYY-MM-DD format
                     return f"{parts[0]}-{parts[1].zfill(2)}-{parts[2].zfill(2)}"
                 else:  # Assume MM-DD-YY or DD-MM-YY
-                    year = '20' + parts[2] if len(parts[2]) == 2 and int(parts[2]) < 50 else parts[2]
+                    year = parts[2]
+                    if len(year) == 2:
+                        year = '20' + year if int(year) < 50 else '19' + year
                     # Try both MM-DD and DD-MM
                     try:
                         from datetime import datetime
@@ -115,7 +125,7 @@ class DataVerifier:
         if field_type in ['date', 'dob']:
             norm1 = self.normalize_date(value1)
             norm2 = self.normalize_date(value2)
-        elif field_type in ['numeric', 'id_number']:
+        elif field_type in ['numeric', 'id_number', 'certificate_number']:
             # Remove non-numeric characters for ID numbers
             norm1 = re.sub(r'\D', '', value1)
             norm2 = re.sub(r'\D', '', value2)
@@ -127,22 +137,34 @@ class DataVerifier:
         # Ratio: simple similarity
         ratio = fuzz.ratio(norm1, norm2) / 100.0
         
-        # Partial ratio: handles partial matches
+        # Partial ratio: handles partial matches (important for names with titles/suffixes)
         partial_ratio = fuzz.partial_ratio(norm1, norm2) / 100.0
         
-        # Token sort ratio: handles word order differences
+        # Token sort ratio: handles word order differences (e.g., "John Doe" vs "Doe, John")
         token_sort_ratio = fuzz.token_sort_ratio(norm1, norm2) / 100.0
         
-        # Token set ratio: handles duplicate words
+        # Token set ratio: handles duplicate words and extra words
         token_set_ratio = fuzz.token_set_ratio(norm1, norm2) / 100.0
         
-        # Use weighted average (emphasize token-based for text, ratio for IDs)
-        if field_type in ['numeric', 'id_number']:
+        # Use the best match from all algorithms
+        # For exact matches, use ratio
+        if ratio == 1.0:
+            similarity = 1.0
+        # For numeric/ID fields, use ratio and partial ratio
+        elif field_type in ['numeric', 'id_number', 'certificate_number']:
             similarity = max(ratio, partial_ratio)
+        # For dates, use ratio (should be exact after normalization)
+        elif field_type in ['date', 'dob']:
+            similarity = ratio if ratio > 0.8 else max(ratio, partial_ratio)
+        # For text fields (names, courses, addresses), use best of all
         else:
             similarity = max(ratio, partial_ratio, token_sort_ratio, token_set_ratio)
         
-        return similarity
+        # Boost similarity if one string is contained in the other (after normalization)
+        if norm1 in norm2 or norm2 in norm1:
+            similarity = max(similarity, 0.9)
+        
+        return min(1.0, similarity)  # Cap at 1.0
     
     def determine_status(self, similarity: float) -> str:
         """
@@ -167,9 +189,11 @@ class DataVerifier:
         
         if any(term in field_name_lower for term in ['date', 'dob', 'birth']):
             return 'date'
-        elif any(term in field_name_lower for term in ['id', 'number', 'num']):
+        elif any(term in field_name_lower for term in ['certificate_number', 'cert_number', 'cert_no', 'certificate_no', 'cert_id']):
+            return 'certificate_number'
+        elif any(term in field_name_lower for term in ['id', 'id_number', 'id_no']):
             return 'id_number'
-        elif any(term in field_name_lower for term in ['phone', 'tel']):
+        elif any(term in field_name_lower for term in ['phone', 'tel', 'mobile']):
             return 'numeric'
         else:
             return 'text'
@@ -191,11 +215,50 @@ class DataVerifier:
         unsure_fields = []
         missing_fields = []
         
+        # Normalize field names for matching (handle variations like "date" vs "dob", "course" vs "course_name")
+        field_mapping = {
+            'date': ['date', 'dob', 'birth_date', 'date_of_birth'],
+            'name': ['name', 'full_name', 'fullname', 'applicant_name'],
+            'course': ['course', 'course_name', 'course_title'],
+            'certificate_number': ['certificate_number', 'cert_number', 'cert_no', 'certificate_no', 'cert_id'],
+            'id_number': ['id_number', 'id', 'identification_number', 'id_no'],
+            'address': ['address', 'street_address', 'residence'],
+            'phone': ['phone', 'telephone', 'mobile', 'contact_number'],
+            'email': ['email', 'e-mail', 'mail']
+        }
+        
+        # Create reverse mapping for quick lookup
+        reverse_mapping = {}
+        for canonical, variants in field_mapping.items():
+            for variant in variants:
+                reverse_mapping[variant.lower()] = canonical
+        
         # Check all form fields
         for field, form_value in form_data.items():
-            document_value = document_data.get(field, "")
+            # Try to find matching document field (handle field name variations)
+            field_lower = field.lower()
+            canonical_field = reverse_mapping.get(field_lower, field_lower)
             
+            # Try multiple field name variations
+            possible_fields = [canonical_field, field, field_lower]
+            document_value = None
+            matched_field = None
+            
+            for possible_field in possible_fields:
+                if possible_field in document_data:
+                    document_value = document_data[possible_field]
+                    matched_field = possible_field
+                    break
+            
+            # If still not found, try case-insensitive search
             if not document_value:
+                for doc_field, doc_value in document_data.items():
+                    if doc_field.lower() == field_lower or doc_field.lower() == canonical_field:
+                        document_value = doc_value
+                        matched_field = doc_field
+                        break
+            
+            if not document_value or not document_value.strip():
                 missing_fields.append(field)
                 field_results.append({
                     'field': field,
@@ -212,6 +275,8 @@ class DataVerifier:
             
             # Determine status
             status = self.determine_status(similarity)
+            
+            logger.debug(f"Verifying field '{field}': document='{document_value}' vs form='{form_value}' -> similarity={similarity:.3f}, status={status}")
             
             field_results.append({
                 'field': field,
@@ -256,4 +321,3 @@ class DataVerifier:
             'missing_fields': missing_fields,
             'extra_fields': list(extra_fields)
         }
-

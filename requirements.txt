@@ -9,7 +9,8 @@ timm==0.9.9
 opencv-python==4.8.1.78
 numpy==1.24.3
 scikit-image==0.22.0
-thefuzz==0.19.0
+thefuzz
+requests==0.19.0
 python-Levenshtein==0.21.1
 PyMuPDF>=1.23.8
 pydantic==2.5.0

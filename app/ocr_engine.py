@@ -67,13 +67,15 @@ class TROCREngine:
             self.processor = None
             self.model = None
     
-    def extract_text(self, image: Image.Image, return_confidence: bool = True) -> Tuple[str, Optional[float]]:
+    def extract_text(self, image: Image.Image, return_confidence: bool = True, lang: str = 'eng', handwritten: bool = False) -> Tuple[str, Optional[float]]:
         """
         Extract text from image
         
         Args:
             image: PIL Image
             return_confidence: Whether to return confidence score
+            lang: Language code (e.g., 'eng', 'hin', 'eng+hin')
+            handwritten: Whether text is handwritten
         
         Returns:
             Tuple of (extracted_text, confidence_score)
@@ -82,11 +84,19 @@ class TROCREngine:
         original_image = image.copy() if hasattr(image, 'copy') else image
         
         # If Tesseract is preferred or TrOCR not available, use Tesseract
-        if self.prefer_tesseract or self.model is None:
+        # For non-English languages (like Hindi) or handwritten text, prefer Tesseract
+        if self.prefer_tesseract or self.model is None or lang != 'eng' or handwritten:
             if self.tesseract_available:
-                logger.info("Using Tesseract as primary OCR")
-                return self.extract_text_tesseract(original_image)
+                if lang != 'eng':
+                    logger.info(f"Using Tesseract as primary OCR for language: {lang} (TrOCR doesn't support non-English well)")
+                elif handwritten:
+                    logger.info("Using Tesseract as primary OCR for handwritten text")
+                else:
+                    logger.info("Using Tesseract as primary OCR")
+                return self.extract_text_tesseract(original_image, lang=lang, handwritten=handwritten)
             else:
+                if lang != 'eng':
+                    raise ValueError(f"Tesseract not available but required for language: {lang}")
                 raise ValueError("Tesseract not available and TrOCR not loaded")
         
         try:
@@ -164,38 +174,27 @@ class TROCREngine:
                 # Use longer sequences and better beam search
                 generated_ids = self.model.generate(
                     pixel_values,
-                    max_length=512,  # Start with 512, can be increased if needed
-                    num_beams=10,  # Increased beams for better quality (was 5)
-                    early_stopping=True,  # Stop at EOS token
+                    max_length=1024,  # Increased for longer text
+                    num_beams=10,  # More beams for better quality
+                    early_stopping=False,  # Don't stop early
                     pad_token_id=pad_token_id,
                     eos_token_id=eos_token_id,
-                    no_repeat_ngram_size=3,  # Prevent 3-gram repetition
+                    no_repeat_ngram_size=3,  # Prevent repetition
                     length_penalty=2.0,  # Encourage longer sequences
-                    do_sample=False,  # Deterministic beam search
-                    repetition_penalty=1.2  # Discourage repetition
+                    do_sample=False,
+                    repetition_penalty=1.2
                 )
+                
                 generated_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
                 
-                # Check if TrOCR is hallucinating (generating text not in image)
-                # Common hallucinations: "THANK", "THANKS", "ITEM", single words
-                hallucination_words = ['thank', 'thanks', 'item', 'hello', 'test']
-                is_hallucination = (
-                    len(generated_text.strip().split()) <= 2 and 
-                    any(word in generated_text.lower() for word in hallucination_words)
-                )
-                
-                if is_hallucination:
-                    logger.warning(f"TrOCR appears to be hallucinating: '{generated_text}' - skipping to region-based extraction")
-                    generated_text = ""  # Force region-based extraction
-                
-                # If text is very short or hallucination, try with longer max_length
-                if (len(generated_text.strip()) < 50 and len(generated_ids[0]) < 100) or is_hallucination:
-                    logger.info("TrOCR extracted short text, trying with longer max_length...")
+                # Try with even longer max_length if result seems short
+                if len(generated_text.strip()) < 100:
+                    logger.info("Trying with longer max_length for better extraction...")
                     generated_ids = self.model.generate(
                         pixel_values,
-                        max_length=1024,  # Try longer
+                        max_length=2048,  # Even longer
                         num_beams=10,
-                        early_stopping=False,  # Don't stop early
+                        early_stopping=False,
                         pad_token_id=pad_token_id,
                         eos_token_id=eos_token_id,
                         no_repeat_ngram_size=3,
@@ -260,7 +259,7 @@ class TROCREngine:
                     logger.info("TrOCR extracted minimal text, trying Tesseract fallback...")
                 try:
                     # Use original image for Tesseract (works better with full resolution)
-                    tesseract_text, tesseract_conf = self.extract_text_tesseract(original_image)
+                    tesseract_text, tesseract_conf = self.extract_text_tesseract(original_image, lang=lang, handwritten=handwritten)
                     if len(tesseract_text.strip()) > len(generated_text.strip()) or hallucination_detected:
                         logger.info(f"Tesseract extracted {len(tesseract_text)} chars vs TrOCR's {len(generated_text)} chars - using Tesseract")
                         return tesseract_text, tesseract_conf
@@ -276,36 +275,325 @@ class TROCREngine:
             # Try fallback to Tesseract if available
             try:
                 logger.info("TrOCR failed, attempting Tesseract fallback...")
-                return self.extract_text_tesseract(image)
+                return self.extract_text_tesseract(image, lang=lang, handwritten=handwritten)
             except Exception as fallback_error:
                 logger.error(f"Both TrOCR and Tesseract failed: {fallback_error}")
                 raise
     
-    def extract_text_tesseract(self, image: Image.Image) -> Tuple[str, Optional[float]]:
-        """Fallback OCR using Tesseract - often more reliable for certificates"""
+    def extract_text_tesseract(self, image: Image.Image, lang: str = 'eng', handwritten: bool = False) -> Tuple[str, Optional[float]]:
+        """Fallback OCR using Tesseract - supports multiple languages and handwritten text
+        
+        Args:
+            image: PIL Image
+            lang: Language code (e.g., 'eng', 'hin', 'eng+hin' for multilingual)
+            handwritten: If True, uses PSM modes optimized for handwritten text
+        """
         try:
             import pytesseract
-            # Tesseract works better with specific config for certificates
-            # Use page segmentation mode 6 (uniform block of text) or 11 (sparse text)
-            custom_config = r'--oem 3 --psm 6'  # OEM 3 = LSTM, PSM 6 = uniform block
-            text = pytesseract.image_to_string(image, lang='eng', config=custom_config)
             
-            # If that doesn't work well, try PSM 11 (sparse text)
-            if len(text.strip()) < 50:
-                logger.info("Trying alternative Tesseract config (PSM 11)...")
-                custom_config = r'--oem 3 --psm 11'
-                text2 = pytesseract.image_to_string(image, lang='eng', config=custom_config)
-                if len(text2.strip()) > len(text.strip()):
-                    text = text2
+            # RUNTIME CHECK: Verify language availability
+            original_lang = lang  # Keep original for logging
+            try:
+                available_langs = pytesseract.get_languages()
+                logger.info(f"Available Tesseract languages: {available_langs}")
+                requested_langs = lang.split('+')
+                missing_langs = [l for l in requested_langs if l not in available_langs]
+                
+                # CRITICAL CHECK: If Hindi is requested, verify it exists
+                if 'hin' in requested_langs:
+                    if 'hin' not in available_langs:
+                        logger.error("=" * 70)
+                        logger.error("CRITICAL ERROR: Hindi language data (hin) is NOT installed!")
+                        logger.error("=" * 70)
+                        logger.error("Runtime check failed: 'hin' not found in pytesseract.get_languages()")
+                        logger.error(f"Available languages: {available_langs}")
+                        logger.error("")
+                        logger.error("IMMEDIATE ACTION REQUIRED:")
+                        logger.error("  1. Download: https://github.com/tesseract-ocr/tessdata/raw/main/hin.traineddata")
+                        logger.error("  2. Place in: C:\\Program Files\\Tesseract-OCR\\tessdata\\hin.traineddata")
+                        logger.error("  3. Verify: Run 'python -c \"import pytesseract; print(\\\"hin\\\" in pytesseract.get_languages())\"'")
+                        logger.error("  4. Restart the FastAPI server")
+                        logger.error("")
+                        logger.error("Note: You may need Administrator rights to copy the file.")
+                        logger.error("=" * 70)
+                        # DO NOT fallback to English - raise error instead
+                        raise ValueError(
+                            "Hindi language data (hin.traineddata) is not installed. "
+                            "Download from https://github.com/tesseract-ocr/tessdata/raw/main/hin.traineddata "
+                            "and place in C:\\Program Files\\Tesseract-OCR\\tessdata\\"
+                        )
+                    else:
+                        logger.info("✓ Runtime check passed: Hindi language data is available")
+                
+                if missing_langs:
+                    logger.error(f"CRITICAL: Language(s) {missing_langs} not available in Tesseract!")
+                    logger.error(f"Available languages: {available_langs}")
+                    # For other missing languages (not Hindi), fallback to eng
+                    if 'hin' not in missing_langs:
+                        logger.warning(f"Language(s) {missing_langs} not available. Falling back to 'eng'.")
+                        lang = 'eng'
+                else:
+                    logger.info(f"✓ Using Tesseract language(s): {lang}")
+            except ValueError:
+                # Re-raise ValueError (Hindi missing) - don't catch it
+                raise
+            except Exception as e:
+                logger.error(f"Could not check available languages: {e}")
+                # If Hindi was requested, still check it exists
+                if 'hin' in lang:
+                    try:
+                        available_langs = pytesseract.get_languages()
+                        if 'hin' not in available_langs:
+                            raise ValueError(
+                                "Hindi language data (hin.traineddata) is not installed. "
+                                "Download from https://github.com/tesseract-ocr/tessdata/raw/main/hin.traineddata "
+                                "and place in C:\\Program Files\\Tesseract-OCR\\tessdata\\"
+                            )
+                    except:
+                        pass
+                # Don't change lang - use what was requested
+                logger.warning(f"Proceeding with requested language: {lang} (may fail if not installed)")
             
-            logger.info(f"Tesseract extracted {len(text)} characters")
-            return text.strip(), 0.75  # Default confidence for Tesseract
+            # Preprocess image for better OCR results (especially for handwritten text and Hindi)
+            processed_image = self._preprocess_for_tesseract(image, handwritten, lang)
+            
+            # Choose PSM mode based on content type
+            # For Hindi, use specific PSM modes that work better with Devanagari script
+            if 'hin' in lang.lower():
+                configs = [
+                    r'--oem 3 --psm 6',   # Uniform block (BEST for Hindi documents)
+                    r'--oem 3 --psm 11',  # Sparse text (for mixed layout with Hindi)
+                    r'--oem 3 --psm 4',   # Single column (for form-like Hindi text)
+                    r'--oem 3 --psm 3',   # Fully automatic (fallback)
+                    r'--oem 3 --psm 1',   # Automatic page segmentation with OSD
+                ]
+                logger.info("Using Hindi-optimized PSM modes for Devanagari script")
+            elif handwritten:
+                # Try multiple PSM modes for handwritten text - optimized for forms
+                configs = [
+                    r'--oem 3 --psm 11',  # Sparse text (BEST for handwritten forms with fields)
+                    r'--oem 3 --psm 6',   # Uniform block (good for structured forms)
+                    r'--oem 3 --psm 4',   # Single column (for form-like layouts)
+                    r'--oem 3 --psm 7',   # Single line (for continuous handwritten text)
+                    r'--oem 3 --psm 13',  # Raw line (treat image as single text line)
+                ]
+                logger.info("Using handwritten text optimized PSM modes")
+            else:
+                # Try multiple PSM modes for printed text
+                configs = [
+                    r'--oem 3 --psm 6',   # Uniform block (best for certificates)
+                    r'--oem 3 --psm 11',  # Sparse text
+                    r'--oem 3 --psm 3',   # Fully automatic (no PSM)
+                ]
+            
+            best_text = ""
+            best_config = configs[0]
+            
+            for config in configs:
+                try:
+                    # Explicitly pass lang parameter to ensure it's used
+                    text = pytesseract.image_to_string(processed_image, lang=lang, config=config)
+                    logger.debug(f"Config {config} with lang '{lang}' extracted {len(text.strip())} characters")
+                    if len(text.strip()) > len(best_text.strip()):
+                        best_text = text
+                        best_config = config
+                        logger.info(f"Best so far: Config {config} with lang '{lang}' extracted {len(text.strip())} characters")
+                except Exception as e:
+                    logger.warning(f"Config {config} with lang '{lang}' failed: {e}")
+                    # For Hindi, DO NOT fallback to English - this would give wrong results
+                    # Instead, log the error and continue trying other configs
+                    if 'hin' in lang.lower():
+                        logger.error(f"Hindi OCR failed with config {config}: {e}")
+                        if 'language' in str(e).lower() or 'lang' in str(e).lower():
+                            logger.error("CRITICAL: Hindi language data is NOT installed!")
+                            logger.error("Run: python install_hindi_lang.py (as Administrator)")
+                    continue
+            
+            # If still poor results, try with original image (less preprocessing)
+            # Also try with different preprocessing strategies
+            if len(best_text.strip()) < 100:
+                logger.info("Trying with original image and alternative preprocessing...")
+                
+                # Try original image
+                for config in [r'--oem 3 --psm 6', r'--oem 3 --psm 11', r'--oem 3 --psm 3']:
+                    try:
+                        text = pytesseract.image_to_string(image, lang=lang, config=config)
+                        logger.debug(f"Original image with lang '{lang}' and {config} extracted {len(text.strip())} chars")
+                        if len(text.strip()) > len(best_text.strip()):
+                            best_text = text
+                            best_config = config
+                            logger.info(f"Original image with lang '{lang}' and {config} gave better result: {len(text.strip())} chars")
+                    except Exception as e:
+                        logger.debug(f"Original image with {config} failed: {e}")
+                        continue
+                
+                # For Hindi, try multiple preprocessing strategies
+                if 'hin' in lang.lower():
+                    logger.info("Trying alternative preprocessing strategies for Hindi...")
+                    try:
+                        import cv2
+                        import numpy as np
+                        cv_img = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+                        
+                        # Strategy 1: Minimal preprocessing (just contrast)
+                        gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+                        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+                        enhanced = clahe.apply(gray)
+                        simple_processed = Image.fromarray(enhanced).convert('RGB')
+                        
+                        # Strategy 2: Original image (no preprocessing - sometimes better for Hindi)
+                        original_rgb = image.convert('RGB')
+                        
+                        # Strategy 3: Grayscale only
+                        gray_only = Image.fromarray(gray).convert('RGB')
+                        
+                        strategies = [
+                            ("minimal_contrast", simple_processed),
+                            ("original", original_rgb),
+                            ("grayscale", gray_only)
+                        ]
+                        
+                        for strategy_name, processed_img in strategies:
+                            for config in [r'--oem 3 --psm 6', r'--oem 3 --psm 11', r'--oem 3 --psm 4']:
+                                try:
+                                    text = pytesseract.image_to_string(processed_img, lang=lang, config=config)
+                                    # Check for Hindi characters
+                                    hindi_chars = sum(1 for c in text if '\u0900' <= c <= '\u097F')
+                                    if len(text.strip()) > len(best_text.strip()) or (hindi_chars > 0 and sum(1 for c in best_text if '\u0900' <= c <= '\u097F') == 0):
+                                        best_text = text
+                                        best_config = config
+                                        logger.info(f"{strategy_name} with {config} gave better result: {len(text.strip())} chars, {hindi_chars} Hindi chars")
+                                except Exception as e:
+                                    logger.debug(f"{strategy_name} with {config} failed: {e}")
+                                    continue
+                    except Exception as e:
+                        logger.warning(f"Alternative preprocessing strategies failed: {e}")
+            
+            # Log final result with language info and Hindi character detection
+            logger.info(f"Tesseract FINAL RESULT: {len(best_text)} characters using language '{lang}' with config {best_config}")
+            if 'hin' in lang.lower():
+                # Check if text contains actual Hindi characters (Devanagari Unicode range: U+0900 to U+097F)
+                hindi_chars = sum(1 for c in best_text if '\u0900' <= c <= '\u097F')
+                if hindi_chars == 0:
+                    logger.error("=" * 70)
+                    logger.error("CRITICAL ERROR: No Hindi (Devanagari) characters detected!")
+                    logger.error("=" * 70)
+                    logger.error(f"Language requested: {lang}")
+                    logger.error(f"Text extracted: {len(best_text)} characters")
+                    logger.error(f"Sample: {best_text[:100] if best_text else 'EMPTY'}")
+                    logger.error("")
+                    logger.error("This means Hindi language data is NOT properly installed.")
+                    logger.error("")
+                    logger.error("IMMEDIATE ACTION REQUIRED:")
+                    logger.error("  1. Run as Administrator: python install_hindi_lang.py")
+                    logger.error("  2. Restart the server")
+                    logger.error("  3. Try again")
+                    logger.error("")
+                    logger.error("Manual installation:")
+                    logger.error("  Download: https://github.com/tesseract-ocr/tessdata/raw/main/hin.traineddata")
+                    logger.error("  Place in: C:\\Program Files\\Tesseract-OCR\\tessdata\\")
+                    logger.error("  (You may need Administrator rights to copy the file)")
+                    logger.error("=" * 70)
+                else:
+                    logger.info(f"SUCCESS: Detected {hindi_chars} Hindi (Devanagari) characters!")
+                    logger.info(f"Hindi OCR is working correctly with language '{lang}'")
+                if len(best_text.strip()) < 50:
+                    logger.warning(f"Very little text extracted ({len(best_text)} chars) - may need better image quality")
+            
+            return best_text.strip(), 0.75  # Default confidence for Tesseract
         except ImportError:
             logger.error("Tesseract (pytesseract) not available as fallback. Install: pip install pytesseract")
             return "", 0.0
         except Exception as e:
             logger.error(f"Tesseract OCR failed: {e}")
             return "", 0.0
+    
+    def _preprocess_for_tesseract(self, image: Image.Image, handwritten: bool = False, lang: str = 'eng') -> Image.Image:
+        """Preprocess image for better Tesseract OCR results, especially for Hindi and handwritten text"""
+        try:
+            import cv2
+            import numpy as np
+            
+            # Upscale image if too small (better for Hindi recognition)
+            width, height = image.size
+            min_dimension = min(width, height)
+            if min_dimension < 1000:
+                scale = 1500 / min_dimension
+                new_width = int(width * scale)
+                new_height = int(height * scale)
+                image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                logger.info(f"Upscaled image from {width}x{height} to {new_width}x{new_height} for better OCR")
+            
+            # Convert PIL to OpenCV
+            cv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+            
+            # Convert to grayscale
+            gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
+            
+            # For Hindi text, use specific preprocessing optimized for Devanagari script
+            if 'hin' in lang.lower():
+                # CRITICAL: Hindi/Devanagari needs very careful preprocessing
+                # Enhance contrast significantly (Devanagari has complex character shapes)
+                clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))  # Higher clip limit
+                gray = clahe.apply(gray)
+                
+                # Apply gentle denoising (preserve character details)
+                gray = cv2.fastNlMeansDenoising(gray, None, 8, 7, 21)  # Reduced strength
+                
+                # Use adaptive thresholding with larger block for Hindi
+                # Devanagari characters are more complex, need larger context
+                binary = cv2.adaptiveThreshold(
+                    gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                    cv2.THRESH_BINARY, 25, 12  # Larger block size for Hindi
+                )
+                
+                # Morphological operations to connect broken Devanagari characters
+                kernel = np.ones((2, 2), np.uint8)
+                binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+                
+                # Additional dilation for better character recognition
+                kernel_dilate = np.ones((1, 1), np.uint8)
+                binary = cv2.dilate(binary, kernel_dilate, iterations=1)
+                
+            elif handwritten:
+                # For handwritten text, use specialized preprocessing
+                # First, enhance contrast to make handwriting clearer
+                clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+                gray = clahe.apply(gray)
+                
+                # Apply gentle Gaussian blur to reduce noise (very gentle for handwritten)
+                gray = cv2.GaussianBlur(gray, (3, 3), 0)
+                
+                # Use adaptive thresholding with larger block size for handwritten text
+                # This helps with variable handwriting quality
+                binary = cv2.adaptiveThreshold(
+                    gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                    cv2.THRESH_BINARY, 21, 10  # Larger block size for handwritten
+                )
+                
+                # Morphological operations to connect broken characters
+                kernel = np.ones((2, 2), np.uint8)
+                binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+            else:
+                # For printed English text, use standard preprocessing
+                # Apply slight denoising
+                denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+                
+                # Enhance contrast
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                gray = clahe.apply(denoised)
+                
+                # Apply thresholding for better contrast
+                _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            
+            # Convert back to RGB for Tesseract
+            processed = cv2.cvtColor(binary, cv2.COLOR_GRAY2RGB)
+            
+            # Convert back to PIL
+            return Image.fromarray(cv2.cvtColor(processed, cv2.COLOR_BGR2RGB))
+        except Exception as e:
+            logger.warning(f"Image preprocessing failed: {e}, using original image")
+            return image
     
     def extract_text_regions(self, image: Image.Image) -> str:
         """
@@ -319,87 +607,36 @@ class TROCREngine:
             width, height = image.size
             logger.info(f"Processing certificate in regions: {width}x{height}")
             
-            # Split into horizontal strips (TrOCR works best with ~384px height)
-            region_height = 384
-            overlap = 50  # Overlap to avoid cutting text
-            regions = []
+            # Split into horizontal strips
+            strip_height = 384  # TrOCR's optimal height
+            num_strips = max(1, height // strip_height)
             
-            y = 0
-            while y < height:
-                # Crop region
-                region = image.crop((0, max(0, y - overlap), width, min(height, y + region_height)))
+            all_text = []
+            for i in range(num_strips):
+                top = i * strip_height
+                bottom = min((i + 1) * strip_height, height)
+                strip = image.crop((0, top, width, bottom))
                 
-                # Resize to optimal TrOCR size if needed
-                r_width, r_height = region.size
-                if r_height < 64:
-                    # Too small, skip
-                    y += region_height - overlap
-                    continue
+                # Process strip with TrOCR
+                pixel_values = self.processor(images=strip, return_tensors="pt").pixel_values
+                pixel_values = pixel_values.to(self.device)
                 
-                # Process this region with TrOCR
-                try:
-                    pixel_values = self.processor(images=region, return_tensors="pt").pixel_values
-                    pixel_values = pixel_values.to(self.device)
-                    
-                    pad_token_id = self.processor.tokenizer.pad_token_id or self.processor.tokenizer.unk_token_id
-                    eos_token_id = self.processor.tokenizer.eos_token_id
-                    
-                    with torch.no_grad():
-                        generated_ids = self.model.generate(
-                            pixel_values,
-                            max_length=256,  # Shorter for each region
-                            num_beams=5,
-                            early_stopping=True,
-                            pad_token_id=pad_token_id,
-                            eos_token_id=eos_token_id,
-                            no_repeat_ngram_size=2,
-                            length_penalty=1.5  # Encourage longer text
-                        )
-                        region_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-                        
-                        # Skip hallucinations in regions too
-                        if region_text.strip() and not any(word in region_text.lower() for word in ['thank', 'thanks', 'item']):
-                            regions.append(region_text.strip())
-                        elif region_text.strip():
-                            logger.warning(f"Skipping hallucinated region text: '{region_text}'")
-                except Exception as e:
-                    logger.warning(f"Error processing region at y={y}: {e}")
-                
-                y += region_height - overlap
+                with torch.no_grad():
+                    generated_ids = self.model.generate(
+                        pixel_values,
+                        max_length=512,
+                        num_beams=5,
+                        early_stopping=False,
+                        pad_token_id=self.processor.tokenizer.pad_token_id or self.processor.tokenizer.unk_token_id,
+                        eos_token_id=self.processor.tokenizer.eos_token_id,
+                        no_repeat_ngram_size=2,
+                        length_penalty=1.5
+                    )
+                    text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+                    if text.strip():
+                        all_text.append(text)
             
-            # Combine all regions
-            combined_text = "\n".join(regions)
-            logger.info(f"Region-based extraction got {len(combined_text)} chars from {len(regions)} regions")
-            return combined_text
-            
+            return "\n".join(all_text)
         except Exception as e:
             logger.error(f"Region-based extraction failed: {e}")
             return ""
-    
-    def extract_with_regions(self, image: Image.Image, regions: list) -> Dict[str, Tuple[str, float]]:
-        """
-        Extract text from specific regions of image
-        
-        Args:
-            image: PIL Image
-            regions: List of dicts with 'name', 'x', 'y', 'width', 'height'
-        
-        Returns:
-            Dict mapping region names to (text, confidence) tuples
-        """
-        results = {}
-        for region in regions:
-            try:
-                # Crop region
-                x, y, w, h = region['x'], region['y'], region['width'], region['height']
-                cropped = image.crop((x, y, x + w, y + h))
-                
-                # Extract text
-                text, confidence = self.extract_text(cropped)
-                results[region['name']] = (text.strip(), confidence or 0.5)
-            except Exception as e:
-                logger.error(f"Error extracting from region {region.get('name')}: {e}")
-                results[region['name']] = ("", 0.0)
-        
-        return results
-

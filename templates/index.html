@@ -11,20 +11,30 @@
             box-sizing: border-box;
         }
         
+        html, body {
+            height: 100%;
+            width: 100%;
+            margin: 0;
+            padding: 0;
+            overflow-x: hidden;
+        }
+        
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             min-height: 100vh;
-            padding: 20px;
+            padding: 0;
         }
         
         .container {
-            max-width: 1200px;
-            margin: 0 auto;
+            width: 100%;
+            min-height: 100vh;
+            margin: 0;
             background: white;
-            border-radius: 15px;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+            border-radius: 0;
+            box-shadow: none;
             padding: 30px;
+            box-sizing: border-box;
         }
         
         h1 {
@@ -303,6 +313,7 @@
         <div class="tabs">
             <button class="tab active" onclick="switchTab('extract')">Extract Text</button>
             <button class="tab" onclick="switchTab('verify')">Verify Data</button>
+            <button class="tab" onclick="switchTab('mosip')">MOSIP Integration</button>
         </div>
         
         <!-- Extract Tab -->
@@ -323,6 +334,22 @@
                     <option value="FORM">Form</option>
                     <option value="CERTIFICATE">Certificate</option>
                 </select>
+            </div>
+            
+            <div class="form-group">
+                <label for="language">Language:</label>
+                <select id="language">
+                    <option value="eng">English</option>
+                    <option value="hin">Hindi</option>
+                    <option value="eng+hin">English + Hindi</option>
+                </select>
+            </div>
+            
+            <div class="form-group">
+                <label>
+                    <input type="checkbox" id="handwritten" style="width: auto; margin-right: 8px;">
+                    Contains Handwritten Text
+                </label>
             </div>
             
             <button class="btn" onclick="extractText()" id="extract-btn">Extract Text</button>
@@ -394,17 +421,34 @@
     <script>
         let extractFile = null;
         let verifyFile = null;
+        let mosipFile = null;
         
         function switchTab(tab) {
             document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
             document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
             
             if (tab === 'extract') {
-                document.querySelector('.tab:first-child').classList.add('active');
+                document.querySelectorAll('.tab')[0].classList.add('active');
                 document.getElementById('extract-tab').classList.add('active');
-            } else {
-                document.querySelector('.tab:last-child').classList.add('active');
+            } else if (tab === 'verify') {
+                document.querySelectorAll('.tab')[1].classList.add('active');
                 document.getElementById('verify-tab').classList.add('active');
+            } else if (tab === 'mosip') {
+                document.querySelectorAll('.tab')[2].classList.add('active');
+                document.getElementById('mosip-tab').classList.add('active');
+            }
+            
+            // Show/hide pre-reg ID field based on service selection
+            const service = document.getElementById('mosip-service');
+            const preRegGroup = document.getElementById('pre-reg-id-group');
+            if (service) {
+                service.addEventListener('change', function() {
+                    if (this.value === 'registration') {
+                        preRegGroup.style.display = 'block';
+                    } else {
+                        preRegGroup.style.display = 'none';
+                    }
+                });
             }
         }
         
@@ -425,9 +469,12 @@
                 if (type === 'extract') {
                     extractFile = files[0];
                     updateFileDisplay('extract', files[0].name);
-                } else {
+                } else if (type === 'verify') {
                     verifyFile = files[0];
                     updateFileDisplay('verify', files[0].name);
+                } else if (type === 'mosip') {
+                    mosipFile = files[0];
+                    updateFileDisplay('mosip', files[0].name);
                 }
             }
         }
@@ -438,18 +485,111 @@
                 if (type === 'extract') {
                     extractFile = file;
                     updateFileDisplay('extract', file.name);
-                } else {
+                } else if (type === 'verify') {
                     verifyFile = file;
                     updateFileDisplay('verify', file.name);
+                } else if (type === 'mosip') {
+                    mosipFile = file;
+                    updateFileDisplay('mosip', file.name);
                 }
             }
         }
         
         function updateFileDisplay(type, filename) {
-            const uploadArea = type === 'extract' 
-                ? document.querySelector('#extract-tab .upload-area')
-                : document.querySelector('#verify-tab .upload-area');
-            uploadArea.innerHTML = `<p>📄 Selected: <strong>${filename}</strong></p>`;
+            let uploadArea;
+            if (type === 'extract') {
+                uploadArea = document.querySelector('#extract-tab .upload-area');
+            } else if (type === 'verify') {
+                uploadArea = document.querySelector('#verify-tab .upload-area');
+            } else if (type === 'mosip') {
+                uploadArea = document.querySelector('#mosip-tab .upload-area');
+            }
+            if (uploadArea) {
+                uploadArea.innerHTML = `<p>📄 Selected: <strong>${filename}</strong></p>`;
+            }
+        }
+        
+        async function submitToMOSIP() {
+            if (!mosipFile) {
+                alert('Please select a file first');
+                return;
+            }
+            
+            const documentType = document.getElementById('mosip-document-type').value;
+            const service = document.getElementById('mosip-service').value;
+            const preRegId = document.getElementById('pre-reg-id').value;
+            
+            const formData = new FormData();
+            formData.append('file', mosipFile);
+            formData.append('document_type', documentType);
+            
+            if (service === 'registration' && !preRegId) {
+                alert('Please enter Pre-registration ID for Registration Client');
+                return;
+            }
+            if (service === 'registration') {
+                formData.append('pre_registration_id', preRegId);
+            }
+            
+            const loading = document.getElementById('mosip-loading');
+            const results = document.getElementById('mosip-results');
+            const content = document.getElementById('mosip-content');
+            const btn = document.getElementById('mosip-btn');
+            
+            loading.classList.add('show');
+            results.classList.remove('show');
+            btn.disabled = true;
+            
+            try {
+                const endpoint = service === 'pre-registration' 
+                    ? '/api/v1/mosip/pre-registration'
+                    : '/api/v1/mosip/registration';
+                
+                const response = await fetch(endpoint, {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                
+                if (!response.ok) {
+                    throw new Error(data.detail || 'MOSIP submission failed');
+                }
+                
+                // Display results
+                let html = `<div class="overall-score">
+                    <p>MOSIP ${service === 'pre-registration' ? 'Pre-registration' : 'Registration'} Status</p>
+                    <h3>✓ Submitted</h3>
+                </div>`;
+                
+                if (data.pre_registration_id || data.registration_id) {
+                    html += `<div class="field-item" style="background: #d4edda; border-left-color: #28a745;">
+                        <div class="field-label">${service === 'pre-registration' ? 'Pre-registration' : 'Registration'} ID</div>
+                        <div class="field-value"><strong>${data.pre_registration_id || data.registration_id}</strong></div>
+                    </div>`;
+                }
+                
+                if (data.mosip_response) {
+                    html += '<h4>MOSIP Response:</h4>';
+                    html += `<div style="background: white; padding: 15px; border-radius: 6px; white-space: pre-wrap; font-family: monospace; max-height: 300px; overflow-y: auto;">${JSON.stringify(data.mosip_response, null, 2)}</div>`;
+                }
+                
+                if (data.ocr_extraction) {
+                    html += '<h4 style="margin-top: 20px;">OCR Extraction Results:</h4>';
+                    html += `<div style="background: white; padding: 15px; border-radius: 6px;">
+                        <p><strong>Overall Confidence:</strong> ${(data.ocr_extraction.overall_confidence * 100).toFixed(1)}%</p>
+                        <p><strong>Extracted Fields:</strong> ${Object.keys(data.ocr_extraction.structured_data).length}</p>
+                    </div>`;
+                }
+                
+                content.innerHTML = html;
+                results.classList.add('show');
+            } catch (error) {
+                alert('Error: ' + error.message);
+            } finally {
+                loading.classList.remove('show');
+                btn.disabled = false;
+            }
         }
         
         async function extractText() {
@@ -459,9 +599,15 @@
             }
             
             const documentType = document.getElementById('document-type').value;
+            const language = document.getElementById('language').value;
+            const handwritten = document.getElementById('handwritten').checked;
             const formData = new FormData();
             formData.append('file', extractFile);
             formData.append('document_type', documentType);
+            formData.append('language', language);
+            formData.append('handwritten', handwritten ? 'true' : 'false');
+            formData.append('include_quality', 'true');  // Always include quality for MOSIP
+            formData.append('include_zones', 'true');     // Always include zones for real-time feedback
             
             const loading = document.getElementById('extract-loading');
             const results = document.getElementById('extract-results');
@@ -490,6 +636,28 @@
                     <h3>${(data.overall_confidence * 100).toFixed(1)}%</h3>
                 </div>`;
                 
+                // Display Quality Score (if available)
+                if (data.quality_score) {
+                    const quality = data.quality_score.quality || 0;
+                    const blur = data.quality_score.blur_score || 0;
+                    const brightness = data.quality_score.brightness || 0;
+                    const contrast = data.quality_score.contrast || 0;
+                    const qualityClass = quality > 0.7 ? 'high' : quality > 0.5 ? 'medium' : 'low';
+                    
+                    html += `<div class="field-item" style="background: #e8f4f8; border-left-color: #17a2b8;">
+                        <div class="field-label">📸 Capture Quality Score</div>
+                        <div style="margin-top: 10px;">
+                            <div><strong>Overall Quality:</strong> <span class="confidence ${qualityClass}">${(quality * 100).toFixed(1)}%</span></div>
+                            <div style="margin-top: 5px; font-size: 14px;">
+                                <span style="margin-right: 15px;">Blur: ${(blur * 100).toFixed(1)}%</span>
+                                <span style="margin-right: 15px;">Brightness: ${(brightness * 100).toFixed(1)}%</span>
+                                <span>Contrast: ${(contrast * 100).toFixed(1)}%</span>
+                            </div>
+                            ${quality < 0.7 ? '<div style="margin-top: 5px; color: #856404; font-size: 12px;">⚠️ Consider retaking the scan for better quality</div>' : ''}
+                        </div>
+                    </div>`;
+                }
+                
                 html += '<h4>Structured Data:</h4>';
                 for (const [field, value] of Object.entries(data.structured_data)) {
                     const confidence = data.confidence_scores[field] || 0;
@@ -503,6 +671,45 @@
                             <div class="field-value">${value || '<em>Not found</em>'}</div>
                         </div>
                     `;
+                }
+                
+                // Display Confidence Zones (if available)
+                if (data.confidence_zones && data.confidence_zones.length > 0) {
+                    html += '<h4 style="margin-top: 20px;">🔍 OCR Confidence Zones (Real-time Feedback):</h4>';
+                    html += '<div style="background: white; padding: 15px; border-radius: 6px; max-height: 300px; overflow-y: auto;">';
+                    html += '<div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px;">';
+                    
+                    // Group zones by confidence level
+                    const highConf = data.confidence_zones.filter(z => z.confidence > 0.8);
+                    const medConf = data.confidence_zones.filter(z => z.confidence > 0.6 && z.confidence <= 0.8);
+                    const lowConf = data.confidence_zones.filter(z => z.confidence <= 0.6);
+                    
+                    if (highConf.length > 0) {
+                        html += `<div><strong style="color: #28a745;">High Confidence (${highConf.length}):</strong><ul style="margin: 5px 0; padding-left: 20px; font-size: 12px;">`;
+                        highConf.slice(0, 10).forEach(z => {
+                            html += `<li>${z.text.substring(0, 30)}... (${(z.confidence * 100).toFixed(0)}%)</li>`;
+                        });
+                        html += '</ul></div>';
+                    }
+                    
+                    if (medConf.length > 0) {
+                        html += `<div><strong style="color: #ffc107;">Medium Confidence (${medConf.length}):</strong><ul style="margin: 5px 0; padding-left: 20px; font-size: 12px;">`;
+                        medConf.slice(0, 10).forEach(z => {
+                            html += `<li>${z.text.substring(0, 30)}... (${(z.confidence * 100).toFixed(0)}%)</li>`;
+                        });
+                        html += '</ul></div>';
+                    }
+                    
+                    if (lowConf.length > 0) {
+                        html += `<div><strong style="color: #dc3545;">Low Confidence (${lowConf.length}):</strong><ul style="margin: 5px 0; padding-left: 20px; font-size: 12px;">`;
+                        lowConf.slice(0, 10).forEach(z => {
+                            html += `<li>${z.text.substring(0, 30)}... (${(z.confidence * 100).toFixed(0)}%)</li>`;
+                        });
+                        html += '</ul></div>';
+                    }
+                    
+                    html += '</div></div>';
+                    html += '<div style="margin-top: 10px; font-size: 12px; color: #666;">💡 Tip: Low confidence zones may need manual review or rescanning</div>';
                 }
                 
                 html += '<h4 style="margin-top: 20px;">Raw Text:</h4>';

@@ -17,6 +17,16 @@ class FieldResult(BaseModel):
     confidence: float = Field(..., ge=0.0, le=1.0)
 
 
+class ConfidenceZone(BaseModel):
+    """A single OCR confidence zone with word-level information"""
+    text: str
+    confidence: float = Field(..., ge=0.0, le=1.0)
+    x: int
+    y: int
+    width: int
+    height: int
+
+
 class OCRExtractionResponse(BaseModel):
     """Response model for OCR extraction"""
     document_type: str
@@ -25,6 +35,8 @@ class OCRExtractionResponse(BaseModel):
     confidence_scores: Dict[str, float]
     overall_confidence: float = Field(..., ge=0.0, le=1.0)
     field_details: Optional[List[FieldResult]] = None
+    quality_score: Optional[Dict[str, float]] = None
+    confidence_zones: Optional[List[ConfidenceZone]] = None
 
 
 class VerificationFieldResult(BaseModel):

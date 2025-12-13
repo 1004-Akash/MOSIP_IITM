@@ -27,6 +27,7 @@ from app.preprocessor import ImagePreprocessor
 from app.field_extractor import FieldExtractor
 from app.verifier import DataVerifier
 from app.models import OCRExtractionResponse, VerificationResponse, VerificationFieldResult
+from app.mosip_integration import get_mosip_integration
 
 # Create necessary directories first
 os.makedirs('uploads', exist_ok=True)
@@ -73,13 +74,52 @@ templates = Jinja2Templates(directory="templates")
 
 
 def get_ocr_engine():
-    """Lazy initialization of OCR engine"""
+    """Lazy initialization of OCR engine - Uses Tesseract by default (fast and reliable)"""
     global ocr_engine
     if ocr_engine is None:
-        logger.info("Initializing OCR engine (prefer fast Tesseract first)...")
-        # Prefer Tesseract for speed; TrOCR remains available as fallback for quality
-        ocr_engine = TROCREngine(prefer_tesseract=True, use_large_model=False)
+        # Default to Tesseract for speed and reliability, allow override via env var
+        env_prefer = os.getenv("USE_TESSERACT_FIRST", "true").lower() == "true"
+        prefer_tesseract = env_prefer  # Default: Tesseract first (fast and reliable)
+        use_large_model = os.getenv("USE_TROCR_LARGE", "false").lower() == "true"
+        if prefer_tesseract:
+            logger.info("Initializing OCR engine: Tesseract primary (faster), TrOCR fallback")
+        else:
+            logger.info("Initializing OCR engine: TrOCR primary (default), Tesseract fallback")
+        if use_large_model:
+            logger.info("Using TrOCR LARGE model (slower, higher quality)")
+        ocr_engine = TROCREngine(prefer_tesseract=prefer_tesseract, use_large_model=use_large_model)
     return ocr_engine
+
+
+def get_confidence_zones(image: Image.Image, lang: str = 'eng') -> list:
+    """
+    Get OCR confidence zones using Tesseract data (word boxes with confidence)
+    
+    Args:
+        image: PIL Image
+        lang: Language code for OCR (default: 'eng')
+    """
+    zones = []
+    try:
+        import pytesseract
+        # Use the specified language for confidence zones
+        data = pytesseract.image_to_data(image, lang=lang, output_type=pytesseract.Output.DICT)
+        n = len(data['text'])
+        for i in range(n):
+            txt = data['text'][i]
+            conf = float(data['conf'][i])
+            if txt.strip() and conf > 0:
+                zones.append({
+                    "text": txt,
+                    "confidence": conf / 100.0,
+                    "x": int(data['left'][i]),
+                    "y": int(data['top'][i]),
+                    "width": int(data['width'][i]),
+                    "height": int(data['height'][i]),
+                })
+    except Exception as e:
+        logger.warning(f"Could not compute confidence zones: {e}")
+    return zones
 
 
 def save_upload_file(upload_file: UploadFile, destination: Path) -> Path:
@@ -93,8 +133,13 @@ def save_upload_file(upload_file: UploadFile, destination: Path) -> Path:
         raise HTTPException(status_code=500, detail=f"Error saving file: {str(e)}")
 
 
-def load_image_from_file(file_path: Path) -> Image.Image:
-    """Load image from file (supports PDF conversion using PyMuPDF)"""
+def load_images_from_file(file_path: Path, max_pages: int = None) -> list:
+    """Load images from file (supports multi-page PDF)
+    
+    Args:
+        file_path: Path to file
+        max_pages: Maximum pages to load (None = all, 1 = first page only for speed)
+    """
     file_ext = file_path.suffix.lower()
     
     if file_ext == '.pdf':
@@ -105,32 +150,30 @@ def load_image_from_file(file_path: Path) -> Image.Image:
             logger.error("PyMuPDF not available for PDF conversion")
             raise HTTPException(status_code=400, detail=error_msg)
         
-        # Convert PDF to image using PyMuPDF (fitz)
-        logger.info("Converting PDF to image using PyMuPDF...")
+        logger.info("Converting PDF to images using PyMuPDF...")
+        images = []
         try:
             pdf_document = fitz.open(str(file_path))
-            if len(pdf_document) == 0:
+            total_pages = len(pdf_document)
+            if total_pages == 0:
+                pdf_document.close()
                 raise HTTPException(status_code=400, detail="PDF file is empty")
             
-            # Get first page
-            page = pdf_document[0]
+            # Limit pages for speed (process first page only by default)
+            pages_to_process = min(total_pages, max_pages) if max_pages else total_pages
             
-            # Convert to image with high DPI for better OCR quality
-            # Use 300 DPI for good balance between quality and performance
-            zoom = 300 / 72  # 300 DPI
+            # Higher DPI for better OCR accuracy, especially for Hindi
+            zoom = 400 / 72  # 400 DPI (increased from 300 for better quality)
             mat = fitz.Matrix(zoom, zoom)
-            pix = page.get_pixmap(matrix=mat, alpha=False)
-            
-            # Convert to PIL Image (more efficient format)
-            img_data = pix.tobytes("png")  # PNG is more efficient than PPM
-            image = Image.open(io.BytesIO(img_data))
-            
-            # Clean up pixmap
-            pix = None
-            
+            for page_num in range(pages_to_process):
+                page = pdf_document[page_num]
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+                img_data = pix.tobytes("png")
+                image = Image.open(io.BytesIO(img_data))
+                images.append(image)
             pdf_document.close()
-            logger.info("PDF converted to image successfully")
-            return image
+            logger.info(f"PDF converted to {len(images)} page(s) (of {total_pages} total)")
+            return images
             
         except HTTPException:
             raise
@@ -141,10 +184,9 @@ def load_image_from_file(file_path: Path) -> Image.Image:
         # Load image directly
         try:
             image = Image.open(file_path)
-            # Convert to RGB if necessary (some formats like RGBA need conversion)
             if image.mode not in ('RGB', 'L'):
                 image = image.convert('RGB')
-            return image
+            return [image]
         except Exception as e:
             logger.error(f"Error loading image: {e}")
             raise HTTPException(status_code=400, detail=f"Error loading image: {str(e)}")
@@ -171,7 +213,12 @@ async def ui(request: Request):
 @app.post("/api/v1/ocr/extract", response_model=OCRExtractionResponse)
 async def extract_ocr(
     file: UploadFile = File(..., description="Image or PDF file"),
-    document_type: str = Form(..., description="Document type: ID_CARD, FORM, CERTIFICATE")
+    document_type: str = Form(..., description="Document type: ID_CARD, FORM, CERTIFICATE"),
+    language: str = Form("eng", description="Language code: 'eng' (English), 'hin' (Hindi), 'eng+hin' (multilingual)"),
+    handwritten: str = Form("false", description="Set to 'true' if document contains handwritten text"),
+    all_pages: str = Form("false", description="Process all PDF pages (default: false, faster)"),
+    include_quality: str = Form("true", description="Include quality metrics (default: true for MOSIP integration)"),
+    include_zones: str = Form("true", description="Include confidence zones (default: true for real-time feedback)")
 ):
     """
     OCR Extraction API
@@ -210,61 +257,98 @@ async def extract_ocr(
         save_upload_file(file, file_path)
         
         try:
-            # Load image
-            image = load_image_from_file(file_path)
+            # Load images (process only first page by default for speed)
+            process_all = all_pages.lower() == "true"
+            images = load_images_from_file(file_path, max_pages=None if process_all else 1)
             
-            # TrOCR works best with original RGB images - minimal preprocessing
-            logger.info("Preparing image for OCR...")
-            # Ensure RGB mode (TrOCR requires RGB)
-            if image.mode != "RGB":
-                processed_image = image.convert("RGB")
-            else:
-                processed_image = image
+            all_raw = []
+            page_confidences = []
+            structured_aggregate = {}
+            confidence_aggregate = {}
+            field_details_all = []
             
-            # TrOCR's processor handles normalization internally
-            # Aggressive preprocessing (grayscale, denoising) actually hurts TrOCR performance
+            # Always calculate quality and zones for better user feedback (especially for Hindi)
+            quality_score = {}
+            confidence_zones = []
+            if images:
+                quality_score = preprocessor.quality_metrics(images[0])
+                # Use the same language for confidence zones as OCR
+                confidence_zones = get_confidence_zones(images[0], lang=language)
             
-            # Extract text using OCR
-            logger.info("Running OCR...")
+            # Use Tesseract by default (fast and reliable)
             engine = get_ocr_engine()
-            raw_text, ocr_confidence = engine.extract_text(processed_image)
+            
+            for idx, image in enumerate(images):
+                # Prepare image (TrOCR needs RGB)
+                if image.mode != "RGB":
+                    processed_image = image.convert("RGB")
+                else:
+                    processed_image = image
+                
+                is_handwritten = handwritten.lower() == "true"
+                logger.info(f"Running OCR on page {idx+1}/{len(images)} with language: {language}, handwritten: {is_handwritten}...")
+                raw_text, ocr_confidence = engine.extract_text(processed_image, lang=language, handwritten=is_handwritten)
+                all_raw.append(raw_text or "")
+                page_confidences.append(ocr_confidence or 0.0)
+                
+                # Extract structured fields per page
+                field_results = field_extractor.extract_fields(
+                    raw_text or "",
+                    document_type,
+                    ocr_confidence or 0.8
+                )
+                # Merge: keep first non-empty for each field
+                for k, v in field_results.items():
+                    if k not in structured_aggregate or not structured_aggregate.get(k):
+                        structured_aggregate[k] = v[0]
+                        confidence_aggregate[k] = v[1]
+                field_details_all.extend([
+                    {"field": k, "value": v[0], "confidence": v[1]}
+                    for k, v in field_results.items()
+                ])
+            
+            # Clean up raw text - remove garbage OCR artifacts
+            def clean_raw_text(text: str) -> str:
+                """Remove garbage OCR artifacts and normalize text"""
+                if not text:
+                    return ""
+                lines = text.split('\n')
+                cleaned_lines = []
+                for line in lines:
+                    line = line.strip()
+                    # Skip lines that are mostly garbage (single characters, random symbols)
+                    if len(line) > 0:
+                        # Skip lines that are mostly non-alphanumeric
+                        alnum_ratio = sum(1 for c in line if c.isalnum() or c.isspace()) / len(line) if line else 0
+                        if alnum_ratio > 0.3:  # At least 30% alphanumeric
+                            # Skip very short lines with mostly symbols
+                            if len(line) > 2 or (len(line) <= 2 and line.isalnum()):
+                                cleaned_lines.append(line)
+                return '\n'.join(cleaned_lines)
+            
+            raw_text_combined = "\n\n".join([clean_raw_text(text) for text in all_raw])
+            # Overall confidence: mean of page confidences or mean of field scores
+            if confidence_aggregate:
+                overall_confidence = sum(confidence_aggregate.values()) / len(confidence_aggregate)
+            elif page_confidences:
+                overall_confidence = sum(page_confidences) / len(page_confidences)
+            else:
+                overall_confidence = 0.0
             
             if not raw_text:
                 logger.warning("No text extracted from document")
                 raw_text = ""
                 ocr_confidence = 0.0
             
-            # Extract structured fields
-            logger.info("Extracting structured fields...")
-            field_results = field_extractor.extract_fields(
-                raw_text,
-                document_type,
-                ocr_confidence or 0.8
-            )
-            
-            # Format response
-            structured_data = {k: v[0] for k, v in field_results.items()}
-            confidence_scores = {k: v[1] for k, v in field_results.items()}
-            
-            # Calculate overall confidence
-            if confidence_scores:
-                overall_confidence = sum(confidence_scores.values()) / len(confidence_scores)
-            else:
-                overall_confidence = ocr_confidence or 0.0
-            
-            # Create field details
-            field_details = [
-                {"field": k, "value": v[0], "confidence": v[1]}
-                for k, v in field_results.items()
-            ]
-            
             response = OCRExtractionResponse(
                 document_type=document_type.upper(),
-                raw_text=raw_text,
-                structured_data=structured_data,
-                confidence_scores=confidence_scores,
+                raw_text=raw_text_combined,
+                structured_data=structured_aggregate,
+                confidence_scores=confidence_aggregate,
                 overall_confidence=overall_confidence,
-                field_details=field_details
+                field_details=field_details_all,
+                quality_score=quality_score,
+                confidence_zones=confidence_zones
             )
             
             logger.info(f"Extraction completed. Overall confidence: {overall_confidence:.2f}")
@@ -280,6 +364,156 @@ async def extract_ocr(
     except Exception as e:
         logger.error(f"Error in OCR extraction: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@app.post("/api/v1/mosip/pre-registration")
+async def mosip_pre_registration(
+    file: UploadFile = File(..., description="Document image or PDF"),
+    document_type: str = Form(..., description="Document type: ID_CARD, FORM, CERTIFICATE")
+):
+    """
+    MOSIP Pre-registration Integration
+    Extracts data from document and submits to MOSIP Pre-registration service
+    """
+    try:
+        # Save file temporarily
+        file_path = Path("uploads") / file.filename
+        save_upload_file(file, file_path)
+        
+        # Extract OCR data with quality and zones enabled
+        images = load_images_from_file(file_path, max_pages=None)
+        if not images:
+            raise HTTPException(status_code=400, detail="Could not load images from file")
+        
+        engine = get_ocr_engine()
+        all_raw = []
+        structured_aggregate = {}
+        quality_score = preprocessor.quality_metrics(images[0]) if images else {}
+        
+        for image in images:
+            if image.mode != "RGB":
+                processed_image = image.convert("RGB")
+            else:
+                processed_image = image
+            raw_text, ocr_confidence = engine.extract_text(processed_image, lang='eng', handwritten=False)
+            all_raw.append(raw_text or "")
+            
+            field_results = field_extractor.extract_fields(
+                raw_text or "",
+                document_type,
+                ocr_confidence or 0.8
+            )
+            for k, v in field_results.items():
+                if k not in structured_aggregate or not structured_aggregate.get(k):
+                    structured_aggregate[k] = v[0]
+        
+        # Get document images as bytes for MOSIP
+        image_bytes_list = []
+        for img in images:
+            img_bytes = io.BytesIO()
+            img.save(img_bytes, format='PNG')
+            image_bytes_list.append(img_bytes.getvalue())
+        
+        # Submit to MOSIP
+        mosip = get_mosip_integration()
+        result = mosip.submit_pre_registration(
+            extracted_data=structured_aggregate,
+            document_images=image_bytes_list,
+            quality_scores=quality_score
+        )
+        
+        return {
+            "ocr_extraction": {
+                "structured_data": structured_aggregate,
+                "raw_text": "\n\n".join(all_raw),
+                "quality_score": quality_score
+            },
+            "mosip_response": result,
+            "pre_registration_id": result.get("response", {}).get("preRegistrationId") if isinstance(result, dict) and "response" in result else None
+        }
+    
+    except Exception as e:
+        logger.error(f"Error in MOSIP Pre-registration: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"MOSIP integration error: {str(e)}")
+    finally:
+        if 'file_path' in locals() and file_path.exists():
+            file_path.unlink()
+
+
+@app.post("/api/v1/mosip/registration")
+async def mosip_registration(
+    pre_registration_id: str = Form(..., description="Pre-registration ID from MOSIP"),
+    file: UploadFile = File(..., description="Document image or PDF"),
+    document_type: str = Form(..., description="Document type")
+):
+    """
+    MOSIP Registration Client Integration
+    Submits registration data to MOSIP Registration Client
+    """
+    try:
+        # Save file temporarily
+        file_path = Path("uploads") / file.filename
+        save_upload_file(file, file_path)
+        
+        # Extract OCR data
+        images = load_images_from_file(file_path, max_pages=None)
+        if not images:
+            raise HTTPException(status_code=400, detail="Could not load images from file")
+        
+        engine = get_ocr_engine()
+        structured_aggregate = {}
+        
+        for image in images:
+            if image.mode != "RGB":
+                processed_image = image.convert("RGB")
+            else:
+                processed_image = image
+            raw_text, ocr_confidence = engine.extract_text(processed_image, lang='eng', handwritten=False)
+            
+            field_results = field_extractor.extract_fields(
+                raw_text or "",
+                document_type,
+                ocr_confidence or 0.8
+            )
+            for k, v in field_results.items():
+                if k not in structured_aggregate or not structured_aggregate.get(k):
+                    structured_aggregate[k] = v[0]
+        
+        # Submit to MOSIP Registration Client
+        mosip = get_mosip_integration()
+        result = mosip.submit_registration(
+            pre_registration_id=pre_registration_id,
+            extracted_data=structured_aggregate
+        )
+        
+        return {
+            "ocr_extraction": {
+                "structured_data": structured_aggregate
+            },
+            "mosip_response": result,
+            "registration_id": result.get("response", {}).get("registrationId") if isinstance(result, dict) and "response" in result else None
+        }
+    
+    except Exception as e:
+        logger.error(f"Error in MOSIP Registration: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"MOSIP integration error: {str(e)}")
+    finally:
+        if 'file_path' in locals() and file_path.exists():
+            file_path.unlink()
+
+
+@app.get("/api/v1/mosip/status/{registration_id}")
+async def mosip_registration_status(registration_id: str):
+    """
+    Get MOSIP Registration Status
+    """
+    try:
+        mosip = get_mosip_integration()
+        result = mosip.get_registration_status(registration_id)
+        return result
+    except Exception as e:
+        logger.error(f"Error getting MOSIP status: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 
 @app.post("/api/v1/verify", response_model=VerificationResponse)
@@ -310,31 +544,47 @@ async def verify_data(
         save_upload_file(file, file_path)
         
         try:
-            # Load image
-            image = load_image_from_file(file_path)
-            
-            # TrOCR works best with original RGB images
-            if image.mode != "RGB":
-                processed_image = image.convert("RGB")
-            else:
-                processed_image = image
-            
-            # Extract text and fields (reuse OCR)
-            logger.info("Extracting document data for verification...")
+            # Load images (multi-page support)
+            images = load_images_from_file(file_path)
             engine = get_ocr_engine()
-            raw_text, ocr_confidence = engine.extract_text(processed_image)
             
-            # Determine document type (try to infer or use generic)
-            document_type = 'ID_CARD'  # Default, could be enhanced with detection
+            all_raw = []
+            page_confidences = []
+            structured_aggregate = {}
             
-            # Extract structured fields from document
-            field_results = field_extractor.extract_fields(
-                raw_text,
-                document_type,
-                ocr_confidence or 0.8
-            )
+            for image in images:
+                if image.mode != "RGB":
+                    processed_image = image.convert("RGB")
+                else:
+                    processed_image = image
+                
+                logger.info("Extracting document data for verification...")
+                # Try to detect document type from form data or use default
+                # Check if form data has certificate-specific fields
+                if any(field in form_data_dict for field in ['course', 'certificate_number', 'date']):
+                    document_type = 'CERTIFICATE'
+                elif any(field in form_data_dict for field in ['dob', 'id_number']):
+                    document_type = 'ID_CARD'
+                else:
+                    document_type = 'FORM'  # Default for forms
+                
+                logger.info(f"Using document type: {document_type} for verification")
+                
+                raw_text, ocr_confidence = engine.extract_text(processed_image)
+                all_raw.append(raw_text or "")
+                page_confidences.append(ocr_confidence or 0.0)
+                
+                field_results = field_extractor.extract_fields(
+                    raw_text or "",
+                    document_type,
+                    ocr_confidence or 0.8
+                )
+                
+                for k, v in field_results.items():
+                    if k not in structured_aggregate or not structured_aggregate.get(k):
+                        structured_aggregate[k] = v[0]
             
-            document_data = {k: v[0] for k, v in field_results.items()}
+            document_data = structured_aggregate
             
             # Verify form data against document data
             logger.info("Verifying form data...")
